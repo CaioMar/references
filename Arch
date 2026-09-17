@@ -1,0 +1,93 @@
+Documento de Requisitos de Arquitetura (RFC / ADR)
+Projeto: Orquestração Multiagentes Cross-Account com Contextualizador Centralizado
+Status: Proposto
+Domínio: Plataforma de Inteligência Artificial Generativa e Sistemas Distribuídos
+1. Visão Geral e Contexto
+Em uma arquitetura multiagentes onde N agentes especialistas residem em runtimes e contas AWS distintas, a comunicação direta via chamadas REST síncronas cruas introduz acoplamento forte, risco de context bloat e estouro de timeouts de infraestrutura (ex: limite de 29s do Amazon API Gateway).
+Cada agente especialista possui sua própria memória episódica e escopo de atuação. Para evitar a transferência contínua do histórico bruto de conversas entre contas, esta arquitetura introduz o Serviço Contextualizador: um componente central (hospedado em uma conta de Shared Services) responsável pela compilação, limpeza e entrega sob demanda do contexto estritamente relevante durante a transição (handoff) de agentes.
+2. Objetivos e Requisitos Não-Funcionais
+ * Isolamento de Memória Episódica: Os agentes especialistas não acessam a conversa completa da sessão, apenas a visão (view) compilada para seu domínio.
+ * Resiliência REST-Native: Comunicação cross-account baseada exclusivamente em HTTP/REST (Webhooks assíncronos), sem dependência de barramentos de mensageria complexos.
+ * Desacoplamento Temporal: Ingestão de turnos e entregas de contexto processadas de forma não-bloqueante (HTTP 202 Accepted).
+ * Baixa Latência no Handoff: Leitura do contexto compilado servida via cache para garantir respostas em poucos milissegundos.
+ * Polimorfismo de Runtime: Independência total de linguagem ou framework (Go, Python, Node.js) nas contas dos especialistas.
+3. Arquitetura Proposta
+3.1. Visão de Componentes
+┌─────────────────────────┐               ┌────────────────────────────────────────────────────────┐               ┌─────────────────────────┐
+│     Conta Agente A      │               │              Conta Shared Services                     │               │     Conta Agente B      │
+│  (Agente de Triagem)    │               │            (Serviço Contextualizador)                  │               │  (Agente Especialista)  │
+└────────────┬────────────┘               └───────────────────────────┬────────────────────────────┘               └────────────┬────────────┘
+             │                                                        │                                                         │
+             │ 1. POST /v1/events/handoff (HTTP 202)                  │                                                         │
+             ├───────────────────────────────────────────────────────►│                                                         │
+             │                                                        │                                                         │
+             │                                                        ├──► [Worker Assíncrono / Queue]                          │
+             │                                                        │    • Agrupa Event Store (DynamoDB)                        │
+             │                                                        │    • Extrai Working Memory & State                          │
+             │                                                        │    • Vetoriza / Busca Snippets (RAG)                        │
+             │                                                        │    • Salva Cache de Leitura (Valkey/Redis)                  │
+             │                                                        │                                                         │
+             │                                                        │ 2. POST /v1/agent/context-webhook (Push)                │
+             │                                                        ├────────────────────────────────────────────────────────►│
+             │                                                        │    (Com Exponential Backoff & Retry)                    │
+             │                                                        │                                                         │
+             │                                                        │ 3. GET /v1/agent/context/{session_id} (Pull / Fallback) │
+             │                                                        │◄────────────────────────────────────────────────────────┤
+
+3.2. Modelo de Dados de Contexto (O Payload de Handoff)
+O Serviço Contextualizador compila o histórico bruto em uma estrutura de 3 camadas de memória:
+{
+  "session_id": "sess_987654321",
+  "target_agent": "AWS_IAM_Specialist",
+  "compiled_context": {
+    "operational_state": {
+      "user_goal": "Resolver falha de autorização na execução de task ECS",
+      "previous_agent": "Triagem_Agent",
+      "handoff_reason": "Necessidade de análise detalhada de IAM Policies"
+    },
+    "working_memory": {
+      "cluster_name": "ecs-prod-core",
+      "service_name": "payment-api",
+      "error_code": "AccessDenied: dynamodb:PutItem",
+      "region": "us-east-1"
+    },
+    "relevant_snippets": [
+      "[User]: Tentei rodar a task via CLI e deu erro de autorização.",
+      "[Triagem]: Task Execution Role validada com sucesso; o bloqueio está na Task Role."
+    ]
+  }
+}
+
+4. Requisitos Funcionais e Fluxos de Integração
+4.1. Fluxo de Ingestão e Registros de Turnos
+ * A cada interação do usuário ou execução de tools, o agente ativo notifica o Contextualizador via POST /v1/events/turn.
+ * O Contextualizador persiste o evento bruto no Amazon DynamoDB (Event Store) e responde com HTTP 202 Accepted.
+4.2. Fluxo de Handoff (Troca de Agente)
+ * O Agente A decide transferir o atendimento e dispara um POST /v1/events/handoff contendo o session_id e o target_agent.
+ * Um worker em segundo plano no Contextualizador:
+   * Classifica a relevância de cada turno do histórico em relação ao domínio do Agente B (descarta ruídos, saudações e retentativas de tools que falharam).
+   * Consolida a Working Memory (variáveis de ambiente, IDs e fatos confirmados).
+   * Recupera os Ksnippets mais relevantes semanticamente e adiciona a janela recente (Tail Window).
+   * Salva o payload final compilado no Amazon ElastiCache (Valkey/Redis).
+4.3. Entrega de Contexto (Modo Dual: Push & Pull)
+ * Modo Push (Webhooks): O Contextualizador dispara uma chamada POST /v1/agent/context-webhook para a rota exposta na conta do Agente B.
+ * Modo Pull (Fallback/Início Direto): Se o Agente B for acionado diretamente, ele faz um GET /v1/agent/context/{session_id}?target_agent=Agente_B lendo o estado pré-compilado diretamente do cache em baixíssima latência.
+5. Requisitos de Resiliência e Tolerância a Falhas
+5.1. Mecanismo de Retentativas e Dead Letter Queue (DLQ)
+ * O envio de Webhooks entre o Contextualizador e os Agentes utiliza filas de reprocessamento (ex: Amazon SQS) com algoritmos de Exponential Backoff e Jitter.
+ * Em caso de indisponibilidade prolongada do webhook do agente especialista (N tentativas sem sucesso), o evento é movido para uma fila de falhas (DLQ) e um sinal de contingência é emitido.
+5.2. Chaves de Idempotência
+ * Todas as chamadas de gravação e consumo REST devem exigir o cabeçalho HTTP X-Idempotency-Key (derivado do event_id ou session_id) para evitar duplicidade na compilação do contexto em cenários de retry.
+5.3. Estratégia de Fallback em 3 Níveis (Graceful Degradation)
+Level 1: Contexto Sintetizado Completo (State + Working Memory + Snippets RAG)
+  └─► Se a sintese falhar/atrasar
+       Level 2: Tail Window Fallback (Leitura das últimas N mensagens brutas do DynamoDB)
+         └─► Se o banco estiver inacessível
+              Level 3: Prompt Limpo + Notificação de Perda de Histórico Momentânea
+
+6. Padronização de Contratos para os Times
+Para integrar um novo agente especialista na plataforma, o time responsável deve obrigatoriamente:
+ * Expor a rota POST /v1/agent/context-webhook com suporte a recebimento assíncrono.
+ * Tratar idempotência checando a chave session_id / event_id.
+ * Notificar o Contextualizador ao final de cada execução utilizando a API de eventos.
+ * Manter o consumo do contexto isolado, sem persistir o histórico de outros especialistas em seus bancos locais.
